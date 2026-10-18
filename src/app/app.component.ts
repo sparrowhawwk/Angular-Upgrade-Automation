@@ -24,26 +24,25 @@ interface FeatureItem {
 }
 
 @Component({
-  selector: 'app-root',
-  standalone: true,
-  imports: [
-    CommonModule,
-    FormsModule,
-    ButtonModule,
-    CardModule,
-    TableModule,
-    TagModule,
-    InputTextModule,
-    ToastModule,
-    ToolbarModule,
-    BadgeModule,
-    AvatarModule,
-    DialogModule,
-    ProgressBarModule,
-  ],
-  providers: [MessageService],
-  templateUrl: './app.component.html',
-  styleUrl: './app.component.css'
+    selector: 'app-root',
+    imports: [
+        CommonModule,
+        FormsModule,
+        ButtonModule,
+        CardModule,
+        TableModule,
+        TagModule,
+        InputTextModule,
+        ToastModule,
+        ToolbarModule,
+        BadgeModule,
+        AvatarModule,
+        DialogModule,
+        ProgressBarModule,
+    ],
+    providers: [MessageService],
+    templateUrl: './app.component.html',
+    styleUrl: './app.component.css'
 })
 export class AppComponent {
   title = signal('Angular 18 & PrimeNG 18');

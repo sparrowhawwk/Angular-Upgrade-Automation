@@ -137,7 +137,7 @@ def run_cmd(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=180
+            timeout=300
         )
         return res.returncode, res.stdout.strip(), res.stderr.strip()
     except Exception as e:
@@ -512,31 +512,40 @@ class DependencyVerifier:
 
 class UpgradeExecutor:
     """Executes safe multi-step upgrade commands with verification."""
-    def __init__(self, workspace_dir: Path, target_major: int, audit_results: List[Dict[str, Any]]):
+    def __init__(self, workspace_dir: Path, current_major: int, target_major: int, audit_results: List[Dict[str, Any]]):
         self.workspace_dir = workspace_dir
+        self.current_major = current_major
         self.target_major = target_major
         self.audit_results = audit_results
 
     def get_upgrade_commands(self) -> List[Dict[str, Any]]:
         cmds = []
-
-        # 1. Angular CLI & Core update
-        cmds.append({
-            "step": 1,
-            "title": f"Update Angular Core & CLI to v{self.target_major}",
-            "command": ["npx", "-y", f"@angular/cli@{self.target_major}", "update", f"@angular/core@{self.target_major}", f"@angular/cli@{self.target_major}", "--force"]
-        })
-
-        # 2. Angular CDK update if present
+        step_counter = 1
         has_cdk = any(r["package"] == "@angular/cdk" for r in self.audit_results)
-        if has_cdk:
-            cmds.append({
-                "step": 2,
-                "title": f"Update Angular CDK to v{self.target_major}",
-                "command": ["npx", "-y", f"@angular/cli@{self.target_major}", "update", f"@angular/cdk@{self.target_major}", "--force"]
-            })
 
-        # 3. Third-party packages (e.g. PrimeNG)
+        # Angular CLI enforces sequential single-major upgrades (e.g. 18 -> 19 -> 20 -> 21)
+        if self.target_major > self.current_major:
+            step_versions = list(range(self.current_major + 1, self.target_major + 1))
+        else:
+            step_versions = [self.target_major]
+
+        prev_v = self.current_major
+        for v in step_versions:
+            pkgs = [f"@angular/core@{v}", f"@angular/cli@{v}"]
+            if has_cdk:
+                pkgs.append(f"@angular/cdk@{v}")
+
+            cmd = ["npx", "-y", f"@angular/cli@{v}", "update"] + pkgs + ["--force", "--allow-dirty"]
+            title_desc = f"v{prev_v} -> v{v}" if len(step_versions) > 1 else f"v{v}"
+            cmds.append({
+                "step": step_counter,
+                "title": f"Migrate Angular Core, CLI & CDK sequentially ({title_desc})",
+                "command": cmd
+            })
+            step_counter += 1
+            prev_v = v
+
+        # Third-party packages (e.g. PrimeNG)
         packages_to_install = []
         for r in self.audit_results:
             if r["package"] in ("primeng", "@primeng/themes") and r["status"] == "UPDATE_REQUIRED":
@@ -544,14 +553,15 @@ class UpgradeExecutor:
 
         if packages_to_install:
             cmds.append({
-                "step": 3,
+                "step": step_counter,
                 "title": f"Update PrimeNG ecosystem to match Angular {self.target_major}",
                 "command": ["npm", "install"] + packages_to_install
             })
+            step_counter += 1
 
-        # 4. Verification build
+        # Verification build
         cmds.append({
-            "step": 4,
+            "step": step_counter,
             "title": "Verify application compilation (Build Test)",
             "command": ["npm", "run", "build"]
         })
@@ -777,7 +787,7 @@ def main():
 
     print(f"{'='*75}")
 
-    executor = UpgradeExecutor(workspace_dir, selected_target, audit_items)
+    executor = UpgradeExecutor(workspace_dir, curr_major or 18, selected_target, audit_items)
     commands = executor.get_upgrade_commands()
 
     print(f"\n{Colors.BOLD}⚙️ Planned Upgrade Steps:{Colors.RESET}")

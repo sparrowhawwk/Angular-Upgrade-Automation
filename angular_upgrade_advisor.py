@@ -6,6 +6,10 @@ A zero-dependency Python tool to inspect an Angular workspace,
 discover active LTS versions from official Angular sources (angular.dev & release APIs),
 audit ecosystem dependencies for compatibility, and safely execute the upgrade.
 
+Fully cross-platform: Runs seamlessly on Windows, macOS, and Linux.
+Corporate-Ready: Supports SSL inspection bypass (--ssl-false / --insecure),
+proxy routing, aggressive timeout prevention, and offline/airgapped environments.
+
 Author: Antigravity Agent
 License: MIT
 """
@@ -17,10 +21,146 @@ import re
 import shutil
 import subprocess
 import argparse
+import socket
+import ssl
 from pathlib import Path
 import urllib.request
 import urllib.error
 from typing import Dict, List, Optional, Tuple, Any
+
+
+def configure_system_path():
+    """Adds common binary directories to PATH if missing (critical for macOS and Windows)."""
+    current_path = os.environ.get("PATH", "")
+    path_sep = ";" if sys.platform == "win32" else ":"
+    existing_dirs = set(filter(None, current_path.split(path_sep)))
+    candidates: List[str] = []
+
+    if sys.platform == "darwin":
+        # macOS Homebrew (Apple Silicon + Intel), MacPorts, and npm global locations
+        candidates = [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/opt/local/bin",
+            os.path.expanduser("~/bin"),
+            os.path.expanduser("~/.npm-global/bin")
+        ]
+    elif sys.platform == "win32":
+        # Windows Node.js, Git, and npm global locations
+        prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        appdata = os.environ.get("APPDATA", "")
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(prog_files, "nodejs"),
+            os.path.join(prog_files_x86, "nodejs"),
+            os.path.join(appdata, "npm"),
+            os.path.join(local_appdata, "Programs", "Git", "cmd"),
+            os.path.join(prog_files, "Git", "cmd"),
+            os.path.join(prog_files_x86, "Git", "cmd"),
+        ]
+    else:
+        # Linux standard locations
+        candidates = [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            os.path.expanduser("~/.local/bin"),
+            os.path.expanduser("~/.npm-global/bin")
+        ]
+
+    to_add = [p for p in candidates if p and os.path.isdir(p) and p not in existing_dirs]
+    if to_add:
+        os.environ["PATH"] = path_sep.join(to_add) + path_sep + current_path
+
+
+def setup_terminal_environment() -> Tuple[bool, bool]:
+    """
+    Initializes terminal encoding, Windows console modes, and detects
+    ANSI color and Unicode capabilities across Windows, macOS, and Linux.
+    
+    Returns (enable_color, enable_unicode).
+    """
+    # 1. Ensure stdout and stderr handle UTF-8 with replacement rather than crashing
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+    is_windows = (sys.platform == "win32")
+    vt_enabled = False
+
+    # 2. Windows-specific console setup
+    if is_windows:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            for handle_id in (-11, -12):
+                h = kernel32.GetStdHandle(handle_id)
+                mode = ctypes.c_ulong()
+                if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                    if kernel32.SetConsoleMode(h, mode.value | 0x0004):
+                        vt_enabled = True
+        except Exception:
+            pass
+
+        if not vt_enabled:
+            try:
+                if os.system("") == 0:
+                    vt_enabled = True
+            except Exception:
+                pass
+
+    # 3. Determine Color Support
+    has_isatty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    term_dumb = (os.environ.get("TERM", "").lower() == "dumb")
+    no_color_env = ("NO_COLOR" in os.environ)
+
+    color_supported = has_isatty and not term_dumb and not no_color_env
+    if is_windows and not vt_enabled:
+        color_supported = False
+
+    # 4. Determine Unicode Support
+    stdout_encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
+    is_ascii_encoding = stdout_encoding in ("ascii", "ansi_x3.4-1968")
+    force_ascii = os.environ.get("FORCE_ASCII", "").lower() in ("1", "true", "yes")
+
+    unicode_supported = not is_ascii_encoding and not force_ascii
+    if unicode_supported:
+        try:
+            "✔╔═".encode(sys.stdout.encoding or "utf-8")
+        except (UnicodeEncodeError, LookupError):
+            unicode_supported = False
+
+    return color_supported, unicode_supported
+
+
+def should_disable_ssl(cli_no_ssl: bool) -> bool:
+    """Detects whether SSL verification should be bypassed via CLI flag or corporate environment variables."""
+    if cli_no_ssl:
+        return True
+    if os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED") == "0":
+        return True
+    if os.environ.get("npm_config_strict_ssl", "").lower() in ("false", "0"):
+        return True
+    if os.environ.get("SSL_NO_VERIFY", "").lower() in ("1", "true", "yes"):
+        return True
+    if os.environ.get("PYTHONHTTPSVERIFY") == "0":
+        return True
+    if os.environ.get("GIT_SSL_NO_VERIFY", "").lower() in ("1", "true", "yes"):
+        return True
+    return False
+
 
 # ANSI Colors for Rich Terminal Output
 class Colors:
@@ -37,6 +177,41 @@ class Colors:
     WHITE = "\033[97m"
     BG_BLUE = "\033[44m"
     BG_GREEN = "\033[42m"
+
+    @classmethod
+    def disable(cls):
+        """Disables all ANSI styling for raw or non-interactive terminals."""
+        for attr in ["RESET", "BOLD", "DIM", "UNDERLINE", "RED", "GREEN",
+                     "YELLOW", "BLUE", "MAGENTA", "CYAN", "WHITE", "BG_BLUE", "BG_GREEN"]:
+            setattr(cls, attr, "")
+
+
+# Terminal Glyphs / Icons with Plain ASCII Fallback
+class Icons:
+    CHECK = "✔"
+    CROSS = "✖"
+    UPDATE = "▲"
+    INFO = "ℹ"
+    WARN = "⚠️"
+    GEAR = "⚙"
+    SHIELD = "🛡️"
+    CLIPBOARD = "📋"
+    MAGNIFIER = "🔍"
+    BULLET = "•"
+
+    @classmethod
+    def set_ascii_mode(cls):
+        """Sets icons to plain ASCII equivalents for non-Unicode environments."""
+        cls.CHECK = "[OK]"
+        cls.CROSS = "[FAIL]"
+        cls.UPDATE = "[UPDATE]"
+        cls.INFO = "[INFO]"
+        cls.WARN = "[WARN]"
+        cls.GEAR = "*"
+        cls.SHIELD = ""
+        cls.CLIPBOARD = ""
+        cls.MAGNIFIER = ""
+        cls.BULLET = "-"
 
 
 # Fallback Angular Version Compatibility Matrix (mirrors angular.dev versions.md)
@@ -89,7 +264,6 @@ def clean_version(ver_str: str) -> str:
     if not ver_str:
         return ""
     cleaned = re.sub(r'^[^\d]*', '', ver_str.strip())
-    # Take first semver-like token
     match = re.search(r'\d+(\.\d+)*', cleaned)
     return match.group(0) if match else cleaned
 
@@ -128,18 +302,62 @@ def satisfies_ts_range(curr: str, req: str) -> bool:
     return True
 
 
-def run_cmd(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
-    """Runs a shell command and returns (exit_code, stdout, stderr)."""
+def run_cmd(
+    cmd: List[str],
+    cwd: Optional[Path] = None,
+    timeout: int = 300,
+    ssl_verify: bool = True
+) -> Tuple[int, str, str]:
+    """
+    Runs a shell command portably across Windows, macOS, and Linux.
+    Injects corporate SSL bypass environment variables if ssl_verify is False,
+    and supports strict timeouts to prevent freezing.
+    
+    Returns (exit_code, stdout, stderr).
+    """
     try:
+        is_windows = (sys.platform == "win32")
+        executable = cmd[0] if cmd else ""
+
+        # Validate executable existence
+        if executable:
+            resolved = shutil.which(executable)
+            if not resolved and is_windows:
+                for ext in [".cmd", ".exe", ".bat", ".ps1"]:
+                    if shutil.which(f"{executable}{ext}"):
+                        resolved = True
+                        break
+            if not resolved:
+                return -1, "", f"Command not found in PATH: '{executable}'. Please ensure it is installed and added to PATH."
+
+        cwd_str = str(cwd) if cwd else None
+
+        # Build execution environment with corporate SSL settings
+        proc_env = os.environ.copy()
+        if not ssl_verify:
+            proc_env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+            proc_env["npm_config_strict_ssl"] = "false"
+            proc_env["GIT_SSL_NO_VERIFY"] = "true"
+
         res = subprocess.run(
             cmd,
-            cwd=cwd,
+            cwd=cwd_str,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=300
+            encoding="utf-8",
+            errors="replace",
+            shell=is_windows,
+            timeout=timeout,
+            env=proc_env
         )
         return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return -1, "", f"Command timed out after {timeout} seconds: {' '.join(cmd)}"
+    except FileNotFoundError as e:
+        return -1, "", f"Executable not found: {e}"
+    except KeyboardInterrupt:
+        raise
     except Exception as e:
         return -1, "", str(e)
 
@@ -147,17 +365,20 @@ def run_cmd(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
 class EnvironmentScanner:
     """Detects local Node.js, npm, and git environment."""
     @staticmethod
-    def get_info() -> Dict[str, Any]:
-        node_code, node_out, _ = run_cmd(["node", "-v"])
-        npm_code, npm_out, _ = run_cmd(["npm", "-v"])
-        git_code, git_out, _ = run_cmd(["git", "status", "--porcelain"])
+    def get_info(workspace_dir: Optional[Path] = None, ssl_verify: bool = True) -> Dict[str, Any]:
+        node_code, node_out, _ = run_cmd(["node", "-v"], cwd=workspace_dir, timeout=5, ssl_verify=ssl_verify)
+        npm_code, npm_out, _ = run_cmd(["npm", "-v"], cwd=workspace_dir, timeout=5, ssl_verify=ssl_verify)
+        git_code, git_out, _ = run_cmd(["git", "status", "--porcelain"], cwd=workspace_dir, timeout=5, ssl_verify=ssl_verify)
+
+        is_git = (git_code == 0)
+        is_clean = is_git and len(git_out) == 0
 
         return {
             "node_version": node_out if node_code == 0 else "Not found",
             "node_major": get_major(node_out) if node_code == 0 else None,
             "npm_version": npm_out if npm_code == 0 else "Not found",
-            "is_git_clean": git_code == 0 and len(git_out) == 0,
-            "git_status": git_out if git_code == 0 else "Not a git repo"
+            "is_git_clean": is_clean,
+            "git_status": git_out if is_git else "Not a git repo"
         }
 
 
@@ -176,13 +397,12 @@ class PackageScanner:
             return False
 
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
+            with open(self.path, "r", encoding="utf-8-sig") as f:
                 self.raw_data = json.load(f)
 
             self.dependencies = self.raw_data.get("dependencies", {})
             self.dev_dependencies = self.raw_data.get("devDependencies", {})
 
-            # Locate Angular core or cli
             core_ver = self.dependencies.get("@angular/core") or self.dev_dependencies.get("@angular/core")
             if not core_ver:
                 core_ver = self.dev_dependencies.get("@angular/cli") or self.dependencies.get("@angular/cli")
@@ -206,18 +426,83 @@ class AngularDevClient:
     VERSIONS_MD_URL = "https://raw.githubusercontent.com/angular/angular/main/adev/src/content/reference/versions.md"
     EOL_API_URL = "https://endoflife.date/api/angular.json"
 
-    def __init__(self, verbose: bool = False):
+    def __init__(
+        self,
+        verbose: bool = False,
+        ssl_verify: bool = True,
+        timeout: int = 5,
+        offline: bool = False
+    ):
         self.verbose = verbose
+        self.ssl_verify = ssl_verify
+        self.timeout = max(1, timeout)
+        self.offline = offline
+        self.network_available = not offline
+
+    def _get_opener(self, verify_ssl: bool) -> urllib.request.OpenerDirector:
+        """Builds an OpenerDirector with corporate proxy routing and designated SSL verification mode."""
+        if not verify_ssl:
+            ctx = ssl._create_unverified_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        else:
+            ctx = ssl.create_default_context()
+
+        proxy_handler = urllib.request.ProxyHandler()  # Auto-picks HTTP_PROXY/HTTPS_PROXY from env
+        https_handler = urllib.request.HTTPSHandler(context=ctx)
+        return urllib.request.build_opener(proxy_handler, https_handler)
 
     def _http_get(self, url: str) -> Optional[str]:
+        """Performs a fast HTTP GET with proxy support, SSL bypass, and timeout resilience."""
+        if self.offline or not self.network_available:
+            return None
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; AngularUpgradeAdvisor/1.0)",
+                "Accept": "*/*"
+            }
+        )
+
+        opener = self._get_opener(self.ssl_verify)
+
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "AngularUpgradeAdvisor/1.0"})
-            with urllib.request.urlopen(req, timeout=6) as res:
-                return res.read().decode("utf-8")
+            with opener.open(req, timeout=self.timeout) as res:
+                return res.read().decode("utf-8", errors="replace")
+        except urllib.error.URLError as e:
+            err_msg = str(e)
+
+            # If SSL inspection proxy triggered CERTIFICATE_VERIFY_FAILED, retry immediately without SSL
+            if self.ssl_verify and ("CERTIFICATE_VERIFY_FAILED" in err_msg or "certificate verify failed" in err_msg.lower()):
+                if self.verbose:
+                    print(f"{Colors.DIM}[debug] Corporate SSL inspection detected for {url}. Retrying with SSL verification disabled...{Colors.RESET}")
+                try:
+                    fallback_opener = self._get_opener(verify_ssl=False)
+                    with fallback_opener.open(req, timeout=self.timeout) as res:
+                        self.ssl_verify = False  # Auto-disable for rest of session
+                        return res.read().decode("utf-8", errors="replace")
+                except Exception as inner_e:
+                    if self.verbose:
+                        print(f"{Colors.DIM}[debug] Insecure SSL retry failed: {inner_e}{Colors.RESET}")
+
+            # If domain blocked or timed out, disable further network probes to prevent delay cascades
+            if any(term in err_msg.lower() for term in ("timed out", "connection refused", "not known", "name resolution", "proxy error")):
+                if self.verbose:
+                    print(f"{Colors.DIM}[debug] Network unreachable or timed out for {url}. Using embedded offline data.{Colors.RESET}")
+                self.network_available = False
+            elif self.verbose:
+                print(f"{Colors.DIM}[debug] HTTP error on {url}: {e}{Colors.RESET}")
+
+        except (TimeoutError, socket.timeout):
+            if self.verbose:
+                print(f"{Colors.DIM}[debug] Network probe timed out after {self.timeout}s for {url}. Using embedded offline data.{Colors.RESET}")
+            self.network_available = False
         except Exception as e:
             if self.verbose:
-                print(f"{Colors.DIM}[debug] Failed to fetch {url}: {e}{Colors.RESET}")
-            return None
+                print(f"{Colors.DIM}[debug] Request failed for {url}: {e}{Colors.RESET}")
+
+        return None
 
     def fetch_versions_matrix(self) -> Dict[int, Dict[str, Any]]:
         """Parses angular.dev versions.md for exact Node, TypeScript, and RxJS ranges."""
@@ -229,14 +514,11 @@ class AngularDevClient:
             return FALLBACK_COMPATIBILITY_MATRIX
 
         try:
-            # Parse markdown table handling escaped pipes \|
             for line in content.splitlines():
                 line = line.strip()
                 if line.startswith("|") and any(c.isdigit() for c in line):
-                    # Protect escaped pipes
                     protected = line.replace(r"\|", "\x00")
                     cols = [c.replace("\x00", "|").strip() for c in protected.split("|")]
-                    # Strip leading and trailing empty elements caused by outer pipes
                     cols = [c for c in cols if c]
                     if len(cols) >= 4:
                         ang_col = cols[0]
@@ -244,11 +526,9 @@ class AngularDevClient:
                         ts_col = cols[2]
                         rxjs_col = cols[3]
 
-                        # Match major version
                         major_match = re.search(r"\b(\d+)\.", ang_col)
                         if major_match:
                             major = int(major_match.group(1))
-                            # Keep first occurrence as it's the latest minor/patch in that major cycle
                             if major not in matrix:
                                 matrix[major] = {
                                     "node": node_col,
@@ -260,7 +540,6 @@ class AngularDevClient:
                 print(f"{Colors.YELLOW}[info] Parsing error on versions.md: {e}. Using fallback.{Colors.RESET}")
             return FALLBACK_COMPATIBILITY_MATRIX
 
-        # Merge with fallback for fields like status and dates
         merged = {}
         for major, data in FALLBACK_COMPATIBILITY_MATRIX.items():
             merged[major] = dict(data)
@@ -273,37 +552,44 @@ class AngularDevClient:
 
     def fetch_lts_lifecycle(self) -> List[Dict[str, Any]]:
         """Fetches LTS cycle metadata from endoflife.date API or npm dist-tags."""
-        content = self._http_get(self.EOL_API_URL)
-        if content:
-            try:
-                data = json.loads(content)
-                if isinstance(data, list):
-                    return data
-            except Exception:
-                pass
+        if not self.offline and self.network_available:
+            content = self._http_get(self.EOL_API_URL)
+            if content:
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, list):
+                        return data
+                except Exception:
+                    pass
 
-        # Fallback to querying npm dist-tags
-        code, out, _ = run_cmd(["npm", "view", "@angular/core", "dist-tags", "--json"])
-        if code == 0:
-            try:
-                tags = json.loads(out)
-                cycles = []
-                for tag, ver in tags.items():
-                    if "lts" in tag or tag == "latest":
-                        m = get_major(ver)
-                        if m:
-                            cycles.append({
-                                "cycle": str(m),
-                                "latest": ver,
-                                "lts": "lts" in tag,
-                                "support": "Active" if tag == "latest" else "LTS",
-                                "eol": "Supported"
-                            })
-                return cycles
-            except Exception:
-                pass
+        # Fallback: Query npm dist-tags with short timeout (6s) and SSL bypass
+        if not self.offline:
+            code, out, _ = run_cmd(
+                ["npm", "view", "@angular/core", "dist-tags", "--json"],
+                timeout=6,
+                ssl_verify=self.ssl_verify
+            )
+            if code == 0:
+                try:
+                    tags = json.loads(out)
+                    cycles = []
+                    for tag, ver in tags.items():
+                        if "lts" in tag or tag == "latest":
+                            m = get_major(ver)
+                            if m:
+                                cycles.append({
+                                    "cycle": str(m),
+                                    "latest": ver,
+                                    "lts": "lts" in tag,
+                                    "support": "Active" if tag == "latest" else "LTS",
+                                    "eol": "Supported"
+                                })
+                    if cycles:
+                        return cycles
+                except Exception:
+                    pass
 
-        # Static fallback list
+        # Instant, comprehensive offline fallback
         return [
             {"cycle": "22", "latest": "22.2.3", "lts": False, "support": "Active", "eol": "2028-06-30"},
             {"cycle": "21", "latest": "21.2.25", "lts": True, "support": "LTS", "eol": "2027-06-30"},
@@ -326,7 +612,6 @@ class DependencyVerifier:
         node_major = self.env_info.get("node_major")
         required_range = self.matrix.get("node", "Unknown")
 
-        # Basic range satisfaction check
         is_ok = True
         warning = None
         if node_major is not None:
@@ -339,6 +624,9 @@ class DependencyVerifier:
             elif self.target_major == 19 and node_major < 18:
                 is_ok = False
                 warning = f"Angular 19 requires Node >= 18. Current: {node_str}"
+        else:
+            is_ok = False
+            warning = f"Node.js runtime was not detected in PATH. Required: {required_range}"
 
         return {
             "name": "Node.js Runtime",
@@ -393,7 +681,6 @@ class DependencyVerifier:
 
             # PrimeNG Ecosystem
             if pkg == "primeng":
-                # PrimeNG versioning strictly matches Angular major versions from v14 onwards
                 target_primeng = f"^{self.target_major}.0.0"
                 if curr_major != self.target_major:
                     results.append({
@@ -511,19 +798,28 @@ class DependencyVerifier:
 
 
 class UpgradeExecutor:
-    """Executes safe multi-step upgrade commands with verification."""
-    def __init__(self, workspace_dir: Path, current_major: int, target_major: int, audit_results: List[Dict[str, Any]]):
+    """Executes safe multi-step upgrade commands with verification across OS and corporate environments."""
+    def __init__(
+        self,
+        workspace_dir: Path,
+        current_major: int,
+        target_major: int,
+        audit_results: List[Dict[str, Any]],
+        ssl_verify: bool = True,
+        cmd_timeout: int = 600
+    ):
         self.workspace_dir = workspace_dir
         self.current_major = current_major
         self.target_major = target_major
         self.audit_results = audit_results
+        self.ssl_verify = ssl_verify
+        self.cmd_timeout = cmd_timeout
 
     def get_upgrade_commands(self) -> List[Dict[str, Any]]:
         cmds = []
         step_counter = 1
         has_cdk = any(r["package"] == "@angular/cdk" for r in self.audit_results)
 
-        # Angular CLI enforces sequential single-major upgrades (e.g. 18 -> 19 -> 20 -> 21)
         if self.target_major > self.current_major:
             step_versions = list(range(self.current_major + 1, self.target_major + 1))
         else:
@@ -545,21 +841,24 @@ class UpgradeExecutor:
             step_counter += 1
             prev_v = v
 
-        # Third-party packages (e.g. PrimeNG)
         packages_to_install = []
         for r in self.audit_results:
             if r["package"] in ("primeng", "@primeng/themes") and r["status"] == "UPDATE_REQUIRED":
                 packages_to_install.append(f"{r['package']}@{r['target']}")
 
         if packages_to_install:
+            install_cmd = ["npm", "install"]
+            if not self.ssl_verify:
+                install_cmd.append("--strict-ssl=false")
+            install_cmd.extend(packages_to_install)
+
             cmds.append({
                 "step": step_counter,
                 "title": f"Update PrimeNG ecosystem to match Angular {self.target_major}",
-                "command": ["npm", "install"] + packages_to_install
+                "command": install_cmd
             })
             step_counter += 1
 
-        # Verification build
         cmds.append({
             "step": step_counter,
             "title": "Verify application compilation (Build Test)",
@@ -582,11 +881,16 @@ class UpgradeExecutor:
             print(f"{Colors.BOLD}{Colors.BLUE}[Step {step_num}/{len(commands)}] {title}{Colors.RESET}")
             print(f"{Colors.DIM}Executing: {cmd_str}{Colors.RESET}")
 
-            code, out, err = run_cmd(cmd, cwd=str(self.workspace_dir))
+            code, out, err = run_cmd(
+                cmd,
+                cwd=self.workspace_dir,
+                timeout=self.cmd_timeout,
+                ssl_verify=self.ssl_verify
+            )
             if code == 0:
-                print(f"{Colors.GREEN}✔ Step {step_num} completed successfully.{Colors.RESET}\n")
+                print(f"{Colors.GREEN}{Icons.CHECK} Step {step_num} completed successfully.{Colors.RESET}\n")
             else:
-                print(f"{Colors.RED}✖ Step {step_num} failed with exit code {code}.{Colors.RESET}")
+                print(f"{Colors.RED}{Icons.CROSS} Step {step_num} failed with exit code {code}.{Colors.RESET}")
                 if err:
                     print(f"{Colors.RED}Error details:{Colors.RESET}\n{err}")
                 elif out:
@@ -594,72 +898,120 @@ class UpgradeExecutor:
                 return False
 
         print(f"{Colors.BOLD}{Colors.GREEN}======================================================{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.GREEN}✔ Angular {self.target_major} upgrade successfully applied & verified!{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}{Icons.CHECK} Angular {self.target_major} upgrade successfully applied & verified!{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.GREEN}======================================================{Colors.RESET}")
         return True
 
 
-def print_banner():
-    banner = f"""{Colors.BOLD}{Colors.CYAN}
+def print_banner(unicode_mode: bool = True):
+    if unicode_mode:
+        banner = f"""{Colors.BOLD}{Colors.CYAN}
  ╔═══════════════════════════════════════════════════════════════════╗
  ║        ANGULAR LTS UPGRADE & DEPENDENCY SAFETY ADVISOR            ║
  ║         Integrated with angular.dev & Official Release APIs       ║
  ╚═══════════════════════════════════════════════════════════════════╝{Colors.RESET}"""
+    else:
+        banner = f"""{Colors.BOLD}{Colors.CYAN}
+ +-------------------------------------------------------------------+
+ |        ANGULAR LTS UPGRADE & DEPENDENCY SAFETY ADVISOR            |
+ |         Integrated with angular.dev & Official Release APIs       |
+ +-------------------------------------------------------------------+{Colors.RESET}"""
     print(banner)
 
 
 def main():
+    configure_system_path()
+    color_supported, unicode_supported = setup_terminal_environment()
+
     parser = argparse.ArgumentParser(
         description="Scans package.json for Angular & dependencies, checks angular.dev for LTS, and guides safe upgrades."
     )
     parser.add_argument("-p", "--path", default="package.json", help="Path to package.json or workspace directory")
     parser.add_argument("-t", "--target", type=int, help="Target Angular major version (e.g., 19, 20, 21)")
     parser.add_argument("-a", "--apply", action="store_true", help="Apply upgrade commands directly after verification")
+    parser.add_argument("-y", "--yes", action="store_true", help="Automatically accept confirmation prompts (non-interactive)")
     parser.add_argument("--dry-run", action="store_true", help="Display audit and commands without prompting to execute")
     parser.add_argument("--json", action="store_true", help="Output audit report as JSON")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
+    parser.add_argument("--ascii", action="store_true", help="Force ASCII characters instead of Unicode symbols")
+    parser.add_argument("-k", "--insecure", "--no-ssl", "--ssl-false", action="store_true", dest="no_ssl",
+                        help="Disable SSL verification for corporate networks, SSL inspection proxies, and self-signed certs")
+    parser.add_argument("--timeout", type=int, default=5, help="Network probe timeout in seconds (default: 5)")
+    parser.add_argument("--cmd-timeout", type=int, default=600, help="Upgrade command execution timeout in seconds (default: 600)")
+    parser.add_argument("--offline", action="store_true", help="Offline/airgapped mode: skips network queries and uses embedded data")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose debug logging")
 
     args = parser.parse_args()
 
-    # Determine workspace and package.json path
-    target_path = Path(args.path)
+    # Determine SSL verification mode
+    ssl_verify = not should_disable_ssl(args.no_ssl)
+
+    # Apply terminal styling preferences
+    if args.no_color or not color_supported:
+        Colors.disable()
+
+    use_unicode = unicode_supported and not args.ascii
+    if not use_unicode:
+        Icons.set_ascii_mode()
+
+    # Determine workspace and package.json path portably
+    target_path = Path(args.path).resolve()
     if target_path.is_dir():
         package_file = target_path / "package.json"
         workspace_dir = target_path
     else:
         package_file = target_path
-        workspace_dir = target_path.parent.resolve()
+        workspace_dir = target_path.parent
 
     if not package_file.exists():
         print(f"{Colors.RED}Error: Cannot find package.json at '{package_file}'{Colors.RESET}", file=sys.stderr)
         sys.exit(1)
 
     if not args.json:
-        print_banner()
+        print_banner(unicode_mode=use_unicode)
 
     # 1. Scan Local Environment & Workspace
-    env_info = EnvironmentScanner.get_info()
+    env_info = EnvironmentScanner.get_info(workspace_dir, ssl_verify=ssl_verify)
     scanner = PackageScanner(package_file)
     if not scanner.scan():
-        print(f"{Colors.RED}Failed to parse package.json{Colors.RESET}", file=sys.stderr)
+        print(f"{Colors.RED}Failed to parse package.json at '{package_file}'{Colors.RESET}", file=sys.stderr)
         sys.exit(1)
 
     curr_major = scanner.angular_major
     curr_version = scanner.angular_core_version or "Unknown"
 
+    # Detect corporate proxy environment
+    active_proxy = (
+        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or
+        os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    )
+
     if not args.json:
-        print(f"\n{Colors.BOLD}🔍 Workspace Assessment:{Colors.RESET}")
-        print(f"  • {Colors.BOLD}Project Directory:{Colors.RESET} {workspace_dir}")
-        print(f"  • {Colors.BOLD}Angular Version:{Colors.RESET}   {Colors.CYAN}{curr_version}{Colors.RESET} (Major: {curr_major})")
-        print(f"  • {Colors.BOLD}Node.js Version:{Colors.RESET}   {Colors.GREEN}{env_info['node_version']}{Colors.RESET}")
-        print(f"  • {Colors.BOLD}npm Version:{Colors.RESET}       {env_info['npm_version']}")
-        print(f"  • {Colors.BOLD}Git Status:{Colors.RESET}        {'Clean' if env_info['is_git_clean'] else Colors.YELLOW + 'Modified files present' + Colors.RESET}")
+        print(f"\n{Colors.BOLD}{Icons.MAGNIFIER} Workspace Assessment:{Colors.RESET}")
+        print(f"  {Icons.BULLET} {Colors.BOLD}Project Directory:{Colors.RESET} {workspace_dir}")
+        print(f"  {Icons.BULLET} {Colors.BOLD}Angular Version:{Colors.RESET}   {Colors.CYAN}{curr_version}{Colors.RESET} (Major: {curr_major})")
+        print(f"  {Icons.BULLET} {Colors.BOLD}Node.js Version:{Colors.RESET}   {Colors.GREEN}{env_info['node_version']}{Colors.RESET}")
+        print(f"  {Icons.BULLET} {Colors.BOLD}npm Version:{Colors.RESET}       {env_info['npm_version']}")
+        print(f"  {Icons.BULLET} {Colors.BOLD}Git Status:{Colors.RESET}        {'Clean' if env_info['is_git_clean'] else Colors.YELLOW + 'Modified files present' + Colors.RESET}")
+        if not ssl_verify:
+            print(f"  {Icons.BULLET} {Colors.BOLD}SSL Verification:{Colors.RESET} {Colors.YELLOW}Bypassed (Corporate / Insecure Mode){Colors.RESET}")
+        if active_proxy:
+            print(f"  {Icons.BULLET} {Colors.BOLD}Corporate Proxy:{Colors.RESET}  {Colors.CYAN}{active_proxy}{Colors.RESET}")
 
     # 2. Fetch official matrix & LTS lifecycles
-    client = AngularDevClient(verbose=args.verbose)
+    client = AngularDevClient(
+        verbose=args.verbose,
+        ssl_verify=ssl_verify,
+        timeout=args.timeout,
+        offline=args.offline
+    )
+
     if not args.json:
-        print(f"\n{Colors.DIM}Connecting to angular.dev & official lifecycle registry...{Colors.RESET}")
-    
+        if args.offline:
+            print(f"\n{Colors.DIM}Offline mode active: using embedded angular.dev compatibility matrix...{Colors.RESET}")
+        else:
+            print(f"\n{Colors.DIM}Connecting to angular.dev & official lifecycle registry (timeout: {args.timeout}s)...{Colors.RESET}")
+
     matrix = client.fetch_versions_matrix()
     lifecycles = client.fetch_lts_lifecycle()
 
@@ -677,7 +1029,6 @@ def main():
         if curr_major is not None and major_num > curr_major and major_num not in seen_majors:
             seen_majors.add(major_num)
             matrix_entry = matrix.get(major_num, {})
-            # Determine status (LTS or Active)
             is_lts = item.get("lts", False) or "LTS" in str(item.get("support", ""))
             status_label = "LTS" if is_lts else "Active"
             active_ends = item.get("support", matrix_entry.get("active_until", "-"))
@@ -694,14 +1045,13 @@ def main():
                 "ts_req": matrix_entry.get("typescript", "See matrix")
             })
 
-    # Sort ascending by major version
     available_lts.sort(key=lambda x: x["major"])
 
     if not available_lts:
         if args.json:
             print(json.dumps({"status": "UP_TO_DATE", "current_major": curr_major, "message": "No newer LTS versions available."}))
         else:
-            print(f"\n{Colors.GREEN}✔ Your project is already on the latest supported Angular major version (v{curr_major})!{Colors.RESET}")
+            print(f"\n{Colors.GREEN}{Icons.CHECK} Your project is already on the latest supported Angular major version (v{curr_major})!{Colors.RESET}")
         sys.exit(0)
 
     # 3. Target Selection
@@ -712,7 +1062,7 @@ def main():
             print(json.dumps({"error": "Target version must be specified via --target in JSON mode."}))
             sys.exit(1)
 
-        print(f"\n{Colors.BOLD}📋 Available Angular LTS & Active Target Versions:{Colors.RESET}")
+        print(f"\n{Colors.BOLD}{Icons.CLIPBOARD} Available Angular LTS & Active Target Versions:{Colors.RESET}")
         print(f"{'#':<3} {'Target':<14} {'Status':<10} {'Latest Release':<16} {'Active Support':<16} {'LTS Until':<14} {'Node.js Required'}")
         print(f"{'-'*3} {'-'*14} {'-'*10} {'-'*16} {'-'*16} {'-'*14} {'-'*20}")
 
@@ -720,7 +1070,10 @@ def main():
             status_color = Colors.GREEN if opt["status"] == "Active" else Colors.BLUE
             print(f"[{idx}] Angular {opt['major']:<6} {status_color}{opt['status']:<10}{Colors.RESET} {opt['latest']:<16} {str(opt['active_ends']):<16} {str(opt['lts_ends']):<14} {opt['node_req']}")
 
-        # Interactive input
+        if not sys.stdin.isatty():
+            print(f"\n{Colors.RED}Error: Non-interactive terminal detected. Please specify target version with --target (e.g. --target {available_lts[0]['major']}).{Colors.RESET}", file=sys.stderr)
+            sys.exit(1)
+
         while True:
             try:
                 choice = input(f"\n{Colors.BOLD}Select target version [1-{len(available_lts)}] or enter major version (e.g. {available_lts[0]['major']}): {Colors.RESET}").strip()
@@ -749,6 +1102,7 @@ def main():
             "workspace": str(workspace_dir),
             "current_angular": curr_version,
             "target_angular": selected_target,
+            "ssl_verify": ssl_verify,
             "node_check": node_check,
             "dependency_audit": audit_items
         }
@@ -756,19 +1110,17 @@ def main():
         sys.exit(0)
 
     # Display Verification Report
-    print(f"\n{Colors.BOLD}🛡️ Compatibility Audit for Angular {selected_target}:{Colors.RESET}")
+    print(f"\n{Colors.BOLD}{Icons.SHIELD} Compatibility Audit for Angular {selected_target}:{Colors.RESET}")
     print(f"{'='*75}")
 
-    # Node Check
     if node_check["status"] == "PASS":
-        print(f"  {Colors.GREEN}✔ Runtime:{Colors.RESET} Node.js {node_check['current']} satisfies requirement ({node_check['required']})")
+        print(f"  {Colors.GREEN}{Icons.CHECK} Runtime:{Colors.RESET} Node.js {node_check['current']} satisfies requirement ({node_check['required']})")
     else:
-        print(f"  {Colors.RED}✖ Runtime:{Colors.RESET} {node_check['warning']}")
+        print(f"  {Colors.RED}{Icons.CROSS} Runtime:{Colors.RESET} {node_check['warning']}")
 
     print(f"\n{'Package':<28} {'Current':<15} {'Target / Recommended':<22} {'Status':<18}")
     print(f"{'-'*28} {'-'*15} {'-'*22} {'-'*18}")
 
-    has_update_needed = False
     for item in audit_items:
         pkg = item["package"]
         curr = item["current"]
@@ -776,21 +1128,27 @@ def main():
         st = item["status"]
 
         if st == "OK":
-            st_badge = f"{Colors.GREEN}✔ Compatible{Colors.RESET}"
+            st_badge = f"{Colors.GREEN}{Icons.CHECK} Compatible{Colors.RESET}"
         elif st == "UPDATE_REQUIRED":
-            st_badge = f"{Colors.YELLOW}▲ Update Needed{Colors.RESET}"
-            has_update_needed = True
+            st_badge = f"{Colors.YELLOW}{Icons.UPDATE} Update Needed{Colors.RESET}"
         else:
-            st_badge = f"{Colors.CYAN}ℹ Verify{Colors.RESET}"
+            st_badge = f"{Colors.CYAN}{Icons.INFO} Verify{Colors.RESET}"
 
         print(f"{pkg:<28} {curr:<15} {tgt:<22} {st_badge}")
 
     print(f"{'='*75}")
 
-    executor = UpgradeExecutor(workspace_dir, curr_major or 18, selected_target, audit_items)
+    executor = UpgradeExecutor(
+        workspace_dir,
+        curr_major or 18,
+        selected_target,
+        audit_items,
+        ssl_verify=ssl_verify,
+        cmd_timeout=args.cmd_timeout
+    )
     commands = executor.get_upgrade_commands()
 
-    print(f"\n{Colors.BOLD}⚙️ Planned Upgrade Steps:{Colors.RESET}")
+    print(f"\n{Colors.BOLD}{Icons.GEAR} Planned Upgrade Steps:{Colors.RESET}")
     for cmd_info in commands:
         print(f"  {Colors.CYAN}{cmd_info['step']}.{Colors.RESET} {cmd_info['title']}")
         print(f"     {Colors.DIM}$ {' '.join(cmd_info['command'])}{Colors.RESET}")
@@ -800,12 +1158,16 @@ def main():
         sys.exit(0)
 
     # 5. Safe Upgrade Confirmation & Execution
-    should_apply = args.apply
+    should_apply = args.apply or args.yes
     if not should_apply:
         print()
         if not env_info["is_git_clean"]:
-            print(f"{Colors.YELLOW}⚠️ Notice: You have uncommitted git changes. It is recommended to stash or commit before upgrading.{Colors.RESET}")
-        
+            print(f"{Colors.YELLOW}{Icons.WARN} Notice: You have uncommitted git changes. It is recommended to stash or commit before upgrading.{Colors.RESET}")
+
+        if not sys.stdin.isatty():
+            print(f"\n{Colors.RED}Non-interactive terminal detected. Run with --apply or -y/--yes to execute upgrade pipeline.{Colors.RESET}", file=sys.stderr)
+            sys.exit(1)
+
         try:
             confirm = input(f"{Colors.BOLD}Proceed with executing this safe upgrade to Angular {selected_target}? [y/N]: {Colors.RESET}").strip().lower()
             if confirm in ("y", "yes"):
@@ -824,4 +1186,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}Operation cancelled by user.{Colors.RESET}")
+        sys.exit(0)

@@ -8,10 +8,10 @@ audit ecosystem dependencies for compatibility, and safely execute the upgrade.
 
 Fully cross-platform: Runs seamlessly on Windows, macOS, and Linux.
 Windows Rules: Always executes via Command Prompt (cmd.exe); never uses PowerShell.
+Workspace Health: Automatically validates and synchronizes local node_modules
+to prevent 'Package is not a dependency' failures.
 Corporate-Ready: Supports SSL inspection bypass (--ssl-false / --insecure),
 proxy routing, aggressive timeout prevention, and offline/airgapped environments.
-Windows-Optimized: Real-time progress streaming, non-interactive CI flags,
-and prompt-deadlock prevention.
 
 Author: Antigravity Agent
 License: MIT
@@ -348,7 +348,6 @@ def run_cmd(
         # Prepare command copy
         exec_cmd = list(cmd)
         if is_windows and exec_cmd:
-            # Enforce .cmd batch files for npm and npx on Windows (never PowerShell .ps1)
             first_tok = exec_cmd[0].lower()
             if first_tok in ("npm", "npm.cmd", "npm.ps1"):
                 exec_cmd[0] = "npm.cmd"
@@ -388,7 +387,6 @@ def run_cmd(
             proc_env["GIT_SSL_NO_VERIFY"] = "true"
 
         if stream_output:
-            # Real-time streaming via cmd.exe on Windows
             process = subprocess.Popen(
                 exec_cmd,
                 cwd=cwd_str,
@@ -417,13 +415,12 @@ def run_cmd(
                 process.kill()
                 return -1, "\n".join(captured_lines), f"Command timed out after {timeout} seconds: {' '.join(exec_cmd)}"
         else:
-            # Buffered mode for quick utility checks
             res = subprocess.run(
                 exec_cmd,
                 cwd=cwd_str,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,  # Prevent input prompt deadlock
+                stdin=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -803,7 +800,7 @@ class DependencyVerifier:
                         "package": pkg,
                         "category": "UI Theming",
                         "current": current_ver,
-                        "target": target_themes,
+                        "target": target_ver,
                         "status": "OK",
                         "risk": "None",
                         "notes": "Compatible"
@@ -879,6 +876,12 @@ class DependencyVerifier:
         return results
 
 
+def is_node_modules_synced(workspace_dir: Path) -> bool:
+    """Checks whether local node_modules has @angular/core installed to prevent ng update failures."""
+    core_pkg = workspace_dir / "node_modules" / "@angular" / "core" / "package.json"
+    return core_pkg.exists()
+
+
 class UpgradeExecutor:
     """Executes safe multi-step upgrade commands with verification across OS and corporate environments."""
     def __init__(
@@ -905,6 +908,20 @@ class UpgradeExecutor:
 
         npx_bin = "npx.cmd" if is_windows else "npx"
         npm_bin = "npm.cmd" if is_windows else "npm"
+
+        # Prerequisite Step: Check if workspace node_modules has @angular/core installed
+        # If node_modules is missing or not installed yet (e.g. freshly cloned repo),
+        # ng update immediately fails with "Package '@angular/core' is not a dependency".
+        if not is_node_modules_synced(self.workspace_dir):
+            install_cmd = [npm_bin, "install", "--legacy-peer-deps", "--no-audit", "--no-fund"]
+            if not self.ssl_verify:
+                install_cmd.append("--strict-ssl=false")
+            cmds.append({
+                "step": step_counter,
+                "title": "Install workspace dependencies (Prerequisite: node_modules missing)",
+                "command": install_cmd
+            })
+            step_counter += 1
 
         if self.target_major > self.current_major:
             step_versions = list(range(self.current_major + 1, self.target_major + 1))
@@ -956,9 +973,12 @@ class UpgradeExecutor:
 
     def execute(self) -> bool:
         commands = self.get_upgrade_commands()
+        is_windows = (sys.platform == "win32")
+        npm_bin = "npm.cmd" if is_windows else "npm"
+
         print(f"\n{Colors.BOLD}{Colors.CYAN}Starting Safe Upgrade Pipeline to Angular {self.target_major}...{Colors.RESET}")
         print(f"{Colors.DIM}Workspace: {self.workspace_dir}{Colors.RESET}")
-        if sys.platform == "win32":
+        if is_windows:
             print(f"{Colors.DIM}Windows Shell: Command Prompt (cmd.exe){Colors.RESET}")
         print(f"{Colors.DIM}Streaming command outputs in real-time. Prompts are automatically handled.{Colors.RESET}\n")
 
@@ -989,6 +1009,39 @@ class UpgradeExecutor:
             if code == 0:
                 print(f"{Colors.GREEN}{Icons.CHECK} Step {step_num} completed successfully ({elapsed:.1f}s).{Colors.RESET}\n")
             else:
+                # Reactive Auto-Recovery: Handle "is not a dependency" or missing node_modules
+                error_combined = f"{out}\n{err}".lower()
+                if "is not a dependency" in error_combined or "found 0 dependencies" in error_combined:
+                    print(f"\n{Colors.YELLOW}⚠️ Detected missing or unlinked workspace dependencies in node_modules.{Colors.RESET}")
+                    print(f"{Colors.CYAN}Automatically running 'npm install' to synchronize workspace dependencies...{Colors.RESET}\n")
+
+                    repair_cmd = [npm_bin, "install", "--legacy-peer-deps", "--no-audit", "--no-fund"]
+                    if not self.ssl_verify:
+                        repair_cmd.append("--strict-ssl=false")
+
+                    repair_code, _, repair_err = run_cmd(
+                        repair_cmd,
+                        cwd=self.workspace_dir,
+                        timeout=self.cmd_timeout,
+                        ssl_verify=self.ssl_verify,
+                        stream_output=True
+                    )
+
+                    if repair_code == 0:
+                        print(f"\n{Colors.GREEN}{Icons.CHECK} Workspace dependencies synchronized. Retrying Step {step_num}...{Colors.RESET}\n")
+                        start_retry = time.time()
+                        code, out, err = run_cmd(
+                            cmd,
+                            cwd=self.workspace_dir,
+                            timeout=self.cmd_timeout,
+                            ssl_verify=self.ssl_verify,
+                            stream_output=True
+                        )
+                        elapsed_retry = time.time() - start_retry
+                        if code == 0:
+                            print(f"{Colors.GREEN}{Icons.CHECK} Step {step_num} completed successfully on retry ({elapsed_retry:.1f}s).{Colors.RESET}\n")
+                            continue
+
                 print(f"{Colors.RED}{Icons.CROSS} Step {step_num} failed with exit code {code} ({elapsed:.1f}s).{Colors.RESET}")
                 if err:
                     print(f"{Colors.RED}Error details:{Colors.RESET}\n{err}")
@@ -1079,6 +1132,8 @@ def main():
         os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
     )
 
+    core_installed = is_node_modules_synced(workspace_dir)
+
     if not args.json:
         print(f"\n{Colors.BOLD}{Icons.MAGNIFIER} Workspace Assessment:{Colors.RESET}")
         print(f"  {Icons.BULLET} {Colors.BOLD}Project Directory:{Colors.RESET} {workspace_dir}")
@@ -1086,6 +1141,7 @@ def main():
         print(f"  {Icons.BULLET} {Colors.BOLD}Node.js Version:{Colors.RESET}   {Colors.GREEN}{env_info['node_version']}{Colors.RESET}")
         print(f"  {Icons.BULLET} {Colors.BOLD}npm Version:{Colors.RESET}       {env_info['npm_version']}")
         print(f"  {Icons.BULLET} {Colors.BOLD}Git Status:{Colors.RESET}        {'Clean' if env_info['is_git_clean'] else Colors.YELLOW + 'Modified files present' + Colors.RESET}")
+        print(f"  {Icons.BULLET} {Colors.BOLD}Local node_modules:{Colors.RESET} {'Verified' if core_installed else Colors.YELLOW + 'Missing/uninstalled (will auto-install via npm install)' + Colors.RESET}")
         if sys.platform == "win32":
             print(f"  {Icons.BULLET} {Colors.BOLD}Windows Shell:{Colors.RESET}     {Colors.GREEN}Command Prompt (cmd.exe){Colors.RESET} [PowerShell disabled]")
         if not ssl_verify:
@@ -1197,6 +1253,7 @@ def main():
             "current_angular": curr_version,
             "target_angular": selected_target,
             "ssl_verify": ssl_verify,
+            "node_modules_synced": core_installed,
             "node_check": node_check,
             "dependency_audit": audit_items
         }

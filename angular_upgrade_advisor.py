@@ -7,8 +7,11 @@ discover active LTS versions from official Angular sources (angular.dev & releas
 audit ecosystem dependencies for compatibility, and safely execute the upgrade.
 
 Fully cross-platform: Runs seamlessly on Windows, macOS, and Linux.
+Windows Rules: Always executes via Command Prompt (cmd.exe); never uses PowerShell.
 Corporate-Ready: Supports SSL inspection bypass (--ssl-false / --insecure),
 proxy routing, aggressive timeout prevention, and offline/airgapped environments.
+Windows-Optimized: Real-time progress streaming, non-interactive CI flags,
+and prompt-deadlock prevention.
 
 Author: Antigravity Agent
 License: MIT
@@ -23,21 +26,32 @@ import subprocess
 import argparse
 import socket
 import ssl
+import time
 from pathlib import Path
 import urllib.request
 import urllib.error
 from typing import Dict, List, Optional, Tuple, Any
 
 
+def get_windows_cmd_exe() -> str:
+    """Returns the absolute path to cmd.exe on Windows, enforcing cmd.exe over PowerShell."""
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    default_cmd = os.path.join(system_root, "System32", "cmd.exe")
+    comspec = os.environ.get("COMSPEC", default_cmd)
+    # Ensure COMSPEC is strictly cmd.exe and never PowerShell
+    if "powershell" in comspec.lower() or not os.path.exists(comspec):
+        comspec = default_cmd
+    return comspec
+
+
 def configure_system_path():
-    """Adds common binary directories to PATH if missing (critical for macOS and Windows)."""
+    """Adds common binary directories to PATH and enforces cmd.exe rules on Windows."""
     current_path = os.environ.get("PATH", "")
     path_sep = ";" if sys.platform == "win32" else ":"
     existing_dirs = set(filter(None, current_path.split(path_sep)))
     candidates: List[str] = []
 
     if sys.platform == "darwin":
-        # macOS Homebrew (Apple Silicon + Intel), MacPorts, and npm global locations
         candidates = [
             "/opt/homebrew/bin",
             "/opt/homebrew/sbin",
@@ -47,7 +61,6 @@ def configure_system_path():
             os.path.expanduser("~/.npm-global/bin")
         ]
     elif sys.platform == "win32":
-        # Windows Node.js, Git, and npm global locations
         prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         appdata = os.environ.get("APPDATA", "")
@@ -60,8 +73,20 @@ def configure_system_path():
             os.path.join(prog_files, "Git", "cmd"),
             os.path.join(prog_files_x86, "Git", "cmd"),
         ]
+
+        # On Windows: Strip .PS1 from PATHEXT to guarantee cmd.exe never executes PowerShell wrappers
+        pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        ext_list = [e.strip() for e in pathext.split(";") if e.strip() and e.strip().upper() != ".PS1"]
+        for standard_ext in reversed([".COM", ".EXE", ".BAT", ".CMD"]):
+            if standard_ext in ext_list:
+                ext_list.remove(standard_ext)
+            ext_list.insert(0, standard_ext)
+        os.environ["PATHEXT"] = ";".join(ext_list)
+
+        # Enforce COMSPEC = cmd.exe
+        os.environ["COMSPEC"] = get_windows_cmd_exe()
+
     else:
-        # Linux standard locations
         candidates = [
             "/usr/local/bin",
             "/usr/bin",
@@ -82,7 +107,6 @@ def setup_terminal_environment() -> Tuple[bool, bool]:
     
     Returns (enable_color, enable_unicode).
     """
-    # 1. Ensure stdout and stderr handle UTF-8 with replacement rather than crashing
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
@@ -93,7 +117,6 @@ def setup_terminal_environment() -> Tuple[bool, bool]:
     is_windows = (sys.platform == "win32")
     vt_enabled = False
 
-    # 2. Windows-specific console setup
     if is_windows:
         try:
             import ctypes
@@ -121,7 +144,6 @@ def setup_terminal_environment() -> Tuple[bool, bool]:
             except Exception:
                 pass
 
-    # 3. Determine Color Support
     has_isatty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
     term_dumb = (os.environ.get("TERM", "").lower() == "dumb")
     no_color_env = ("NO_COLOR" in os.environ)
@@ -130,7 +152,6 @@ def setup_terminal_environment() -> Tuple[bool, bool]:
     if is_windows and not vt_enabled:
         color_supported = False
 
-    # 4. Determine Unicode Support
     stdout_encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
     is_ascii_encoding = stdout_encoding in ("ascii", "ansi_x3.4-1968")
     force_ascii = os.environ.get("FORCE_ASCII", "").lower() in ("1", "true", "yes")
@@ -306,24 +327,41 @@ def run_cmd(
     cmd: List[str],
     cwd: Optional[Path] = None,
     timeout: int = 300,
-    ssl_verify: bool = True
+    ssl_verify: bool = True,
+    stream_output: bool = False
 ) -> Tuple[int, str, str]:
     """
     Runs a shell command portably across Windows, macOS, and Linux.
-    Injects corporate SSL bypass environment variables if ssl_verify is False,
-    and supports strict timeouts to prevent freezing.
     
-    Returns (exit_code, stdout, stderr).
+    Windows Rules:
+    - ALWAYS uses cmd.exe as the execution shell; NEVER uses PowerShell.
+    - Resolves npm and npx to npm.cmd and npx.cmd (never .ps1).
+    - Injects CI=true, NG_CLI_ANALYTICS=false, npm_config_yes=true to completely
+      eliminate interactive prompts that freeze headless or background tasks on Windows.
+    - Connects stdin to DEVNULL to prevent invisible prompt deadlocks.
+    - When stream_output=True, streams lines in real-time with prefix styling.
     """
     try:
         is_windows = (sys.platform == "win32")
-        executable = cmd[0] if cmd else ""
+        cmd_shell_exe = get_windows_cmd_exe() if is_windows else None
+
+        # Prepare command copy
+        exec_cmd = list(cmd)
+        if is_windows and exec_cmd:
+            # Enforce .cmd batch files for npm and npx on Windows (never PowerShell .ps1)
+            first_tok = exec_cmd[0].lower()
+            if first_tok in ("npm", "npm.cmd", "npm.ps1"):
+                exec_cmd[0] = "npm.cmd"
+            elif first_tok in ("npx", "npx.cmd", "npx.ps1"):
+                exec_cmd[0] = "npx.cmd"
+
+        executable = exec_cmd[0] if exec_cmd else ""
 
         # Validate executable existence
         if executable:
             resolved = shutil.which(executable)
             if not resolved and is_windows:
-                for ext in [".cmd", ".exe", ".bat", ".ps1"]:
+                for ext in [".cmd", ".exe", ".bat"]:
                     if shutil.which(f"{executable}{ext}"):
                         resolved = True
                         break
@@ -332,26 +370,70 @@ def run_cmd(
 
         cwd_str = str(cwd) if cwd else None
 
-        # Build execution environment with corporate SSL settings
+        # Build execution environment
         proc_env = os.environ.copy()
+        proc_env["CI"] = "true"                        # Disable all interactive CLI prompts
+        proc_env["NG_CLI_ANALYTICS"] = "false"         # Disable Angular analytics prompt
+        proc_env["npm_config_yes"] = "true"            # Auto-confirm npx/npm prompts
+        proc_env["npm_config_fund"] = "false"          # Suppress npm funding messages
+        proc_env["npm_config_audit"] = "false"         # Skip npm audit delays
+
+        if is_windows:
+            proc_env["COMSPEC"] = cmd_shell_exe        # Strictly enforce cmd.exe
+            proc_env["PATHEXT"] = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+
         if not ssl_verify:
             proc_env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
             proc_env["npm_config_strict_ssl"] = "false"
             proc_env["GIT_SSL_NO_VERIFY"] = "true"
 
-        res = subprocess.run(
-            cmd,
-            cwd=cwd_str,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=is_windows,
-            timeout=timeout,
-            env=proc_env
-        )
-        return res.returncode, res.stdout.strip(), res.stderr.strip()
+        if stream_output:
+            # Real-time streaming via cmd.exe on Windows
+            process = subprocess.Popen(
+                exec_cmd,
+                cwd=cwd_str,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,  # Prevent background prompt deadlocks
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=is_windows,
+                executable=cmd_shell_exe if is_windows else None,
+                env=proc_env,
+                bufsize=1
+            )
+            captured_lines: List[str] = []
+            try:
+                for line in iter(process.stdout.readline, ''):
+                    clean_line = line.rstrip('\r\n')
+                    if clean_line:
+                        print(f"  {Colors.DIM}│{Colors.RESET} {clean_line}")
+                        captured_lines.append(clean_line)
+                process.stdout.close()
+                returncode = process.wait(timeout=timeout)
+                return returncode, "\n".join(captured_lines), ""
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return -1, "\n".join(captured_lines), f"Command timed out after {timeout} seconds: {' '.join(exec_cmd)}"
+        else:
+            # Buffered mode for quick utility checks
+            res = subprocess.run(
+                exec_cmd,
+                cwd=cwd_str,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,  # Prevent input prompt deadlock
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=is_windows,
+                executable=cmd_shell_exe if is_windows else None,
+                timeout=timeout,
+                env=proc_env
+            )
+            return res.returncode, res.stdout.strip(), res.stderr.strip()
+
     except subprocess.TimeoutExpired:
         return -1, "", f"Command timed out after {timeout} seconds: {' '.join(cmd)}"
     except FileNotFoundError as e:
@@ -366,8 +448,9 @@ class EnvironmentScanner:
     """Detects local Node.js, npm, and git environment."""
     @staticmethod
     def get_info(workspace_dir: Optional[Path] = None, ssl_verify: bool = True) -> Dict[str, Any]:
+        npm_bin = "npm.cmd" if sys.platform == "win32" else "npm"
         node_code, node_out, _ = run_cmd(["node", "-v"], cwd=workspace_dir, timeout=5, ssl_verify=ssl_verify)
-        npm_code, npm_out, _ = run_cmd(["npm", "-v"], cwd=workspace_dir, timeout=5, ssl_verify=ssl_verify)
+        npm_code, npm_out, _ = run_cmd([npm_bin, "-v"], cwd=workspace_dir, timeout=5, ssl_verify=ssl_verify)
         git_code, git_out, _ = run_cmd(["git", "status", "--porcelain"], cwd=workspace_dir, timeout=5, ssl_verify=ssl_verify)
 
         is_git = (git_code == 0)
@@ -448,7 +531,7 @@ class AngularDevClient:
         else:
             ctx = ssl.create_default_context()
 
-        proxy_handler = urllib.request.ProxyHandler()  # Auto-picks HTTP_PROXY/HTTPS_PROXY from env
+        proxy_handler = urllib.request.ProxyHandler()
         https_handler = urllib.request.HTTPSHandler(context=ctx)
         return urllib.request.build_opener(proxy_handler, https_handler)
 
@@ -473,20 +556,18 @@ class AngularDevClient:
         except urllib.error.URLError as e:
             err_msg = str(e)
 
-            # If SSL inspection proxy triggered CERTIFICATE_VERIFY_FAILED, retry immediately without SSL
             if self.ssl_verify and ("CERTIFICATE_VERIFY_FAILED" in err_msg or "certificate verify failed" in err_msg.lower()):
                 if self.verbose:
                     print(f"{Colors.DIM}[debug] Corporate SSL inspection detected for {url}. Retrying with SSL verification disabled...{Colors.RESET}")
                 try:
                     fallback_opener = self._get_opener(verify_ssl=False)
                     with fallback_opener.open(req, timeout=self.timeout) as res:
-                        self.ssl_verify = False  # Auto-disable for rest of session
+                        self.ssl_verify = False
                         return res.read().decode("utf-8", errors="replace")
                 except Exception as inner_e:
                     if self.verbose:
                         print(f"{Colors.DIM}[debug] Insecure SSL retry failed: {inner_e}{Colors.RESET}")
 
-            # If domain blocked or timed out, disable further network probes to prevent delay cascades
             if any(term in err_msg.lower() for term in ("timed out", "connection refused", "not known", "name resolution", "proxy error")):
                 if self.verbose:
                     print(f"{Colors.DIM}[debug] Network unreachable or timed out for {url}. Using embedded offline data.{Colors.RESET}")
@@ -562,10 +643,11 @@ class AngularDevClient:
                 except Exception:
                     pass
 
-        # Fallback: Query npm dist-tags with short timeout (6s) and SSL bypass
+        # Fallback: Query npm dist-tags with short timeout (6s) and SSL bypass via cmd.exe
         if not self.offline:
+            npm_bin = "npm.cmd" if sys.platform == "win32" else "npm"
             code, out, _ = run_cmd(
-                ["npm", "view", "@angular/core", "dist-tags", "--json"],
+                [npm_bin, "view", "@angular/core", "dist-tags", "--json"],
                 timeout=6,
                 ssl_verify=self.ssl_verify
             )
@@ -721,7 +803,7 @@ class DependencyVerifier:
                         "package": pkg,
                         "category": "UI Theming",
                         "current": current_ver,
-                        "target": current_ver,
+                        "target": target_themes,
                         "status": "OK",
                         "risk": "None",
                         "notes": "Compatible"
@@ -819,6 +901,10 @@ class UpgradeExecutor:
         cmds = []
         step_counter = 1
         has_cdk = any(r["package"] == "@angular/cdk" for r in self.audit_results)
+        is_windows = (sys.platform == "win32")
+
+        npx_bin = "npx.cmd" if is_windows else "npx"
+        npm_bin = "npm.cmd" if is_windows else "npm"
 
         if self.target_major > self.current_major:
             step_versions = list(range(self.current_major + 1, self.target_major + 1))
@@ -831,7 +917,8 @@ class UpgradeExecutor:
             if has_cdk:
                 pkgs.append(f"@angular/cdk@{v}")
 
-            cmd = ["npx", "-y", f"@angular/cli@{v}", "update"] + pkgs + ["--force", "--allow-dirty"]
+            # Explicitly target npx.cmd on Windows via cmd.exe
+            cmd = [npx_bin, "--yes", f"@angular/cli@{v}", "update"] + pkgs + ["--force", "--allow-dirty"]
             title_desc = f"v{prev_v} -> v{v}" if len(step_versions) > 1 else f"v{v}"
             cmds.append({
                 "step": step_counter,
@@ -847,7 +934,7 @@ class UpgradeExecutor:
                 packages_to_install.append(f"{r['package']}@{r['target']}")
 
         if packages_to_install:
-            install_cmd = ["npm", "install"]
+            install_cmd = [npm_bin, "install", "--no-audit", "--no-fund"]
             if not self.ssl_verify:
                 install_cmd.append("--strict-ssl=false")
             install_cmd.extend(packages_to_install)
@@ -862,7 +949,7 @@ class UpgradeExecutor:
         cmds.append({
             "step": step_counter,
             "title": "Verify application compilation (Build Test)",
-            "command": ["npm", "run", "build"]
+            "command": [npm_bin, "run", "build"]
         })
 
         return cmds
@@ -870,7 +957,10 @@ class UpgradeExecutor:
     def execute(self) -> bool:
         commands = self.get_upgrade_commands()
         print(f"\n{Colors.BOLD}{Colors.CYAN}Starting Safe Upgrade Pipeline to Angular {self.target_major}...{Colors.RESET}")
-        print(f"{Colors.DIM}Workspace: {self.workspace_dir}{Colors.RESET}\n")
+        print(f"{Colors.DIM}Workspace: {self.workspace_dir}{Colors.RESET}")
+        if sys.platform == "win32":
+            print(f"{Colors.DIM}Windows Shell: Command Prompt (cmd.exe){Colors.RESET}")
+        print(f"{Colors.DIM}Streaming command outputs in real-time. Prompts are automatically handled.{Colors.RESET}\n")
 
         for item in commands:
             step_num = item["step"]
@@ -881,20 +971,27 @@ class UpgradeExecutor:
             print(f"{Colors.BOLD}{Colors.BLUE}[Step {step_num}/{len(commands)}] {title}{Colors.RESET}")
             print(f"{Colors.DIM}Executing: {cmd_str}{Colors.RESET}")
 
+            if "npx" in cmd[0]:
+                print(f"{Colors.DIM}Note: Fetching and executing temporary CLI package via npm. Please wait...{Colors.RESET}")
+
+            start_t = time.time()
+
             code, out, err = run_cmd(
                 cmd,
                 cwd=self.workspace_dir,
                 timeout=self.cmd_timeout,
-                ssl_verify=self.ssl_verify
+                ssl_verify=self.ssl_verify,
+                stream_output=True
             )
+
+            elapsed = time.time() - start_t
+
             if code == 0:
-                print(f"{Colors.GREEN}{Icons.CHECK} Step {step_num} completed successfully.{Colors.RESET}\n")
+                print(f"{Colors.GREEN}{Icons.CHECK} Step {step_num} completed successfully ({elapsed:.1f}s).{Colors.RESET}\n")
             else:
-                print(f"{Colors.RED}{Icons.CROSS} Step {step_num} failed with exit code {code}.{Colors.RESET}")
+                print(f"{Colors.RED}{Icons.CROSS} Step {step_num} failed with exit code {code} ({elapsed:.1f}s).{Colors.RESET}")
                 if err:
                     print(f"{Colors.RED}Error details:{Colors.RESET}\n{err}")
-                elif out:
-                    print(f"{Colors.YELLOW}Output details:{Colors.RESET}\n{out[-800:]}")
                 return False
 
         print(f"{Colors.BOLD}{Colors.GREEN}======================================================{Colors.RESET}")
@@ -943,10 +1040,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Determine SSL verification mode
     ssl_verify = not should_disable_ssl(args.no_ssl)
 
-    # Apply terminal styling preferences
     if args.no_color or not color_supported:
         Colors.disable()
 
@@ -954,7 +1049,6 @@ def main():
     if not use_unicode:
         Icons.set_ascii_mode()
 
-    # Determine workspace and package.json path portably
     target_path = Path(args.path).resolve()
     if target_path.is_dir():
         package_file = target_path / "package.json"
@@ -980,7 +1074,6 @@ def main():
     curr_major = scanner.angular_major
     curr_version = scanner.angular_core_version or "Unknown"
 
-    # Detect corporate proxy environment
     active_proxy = (
         os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or
         os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
@@ -993,6 +1086,8 @@ def main():
         print(f"  {Icons.BULLET} {Colors.BOLD}Node.js Version:{Colors.RESET}   {Colors.GREEN}{env_info['node_version']}{Colors.RESET}")
         print(f"  {Icons.BULLET} {Colors.BOLD}npm Version:{Colors.RESET}       {env_info['npm_version']}")
         print(f"  {Icons.BULLET} {Colors.BOLD}Git Status:{Colors.RESET}        {'Clean' if env_info['is_git_clean'] else Colors.YELLOW + 'Modified files present' + Colors.RESET}")
+        if sys.platform == "win32":
+            print(f"  {Icons.BULLET} {Colors.BOLD}Windows Shell:{Colors.RESET}     {Colors.GREEN}Command Prompt (cmd.exe){Colors.RESET} [PowerShell disabled]")
         if not ssl_verify:
             print(f"  {Icons.BULLET} {Colors.BOLD}SSL Verification:{Colors.RESET} {Colors.YELLOW}Bypassed (Corporate / Insecure Mode){Colors.RESET}")
         if active_proxy:
@@ -1015,7 +1110,6 @@ def main():
     matrix = client.fetch_versions_matrix()
     lifecycles = client.fetch_lts_lifecycle()
 
-    # Identify available upgrades (newer major versions)
     available_lts: List[Dict[str, Any]] = []
     seen_majors = set()
 
